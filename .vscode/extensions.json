@@ -1,0 +1,8 @@
+{
+  "recommendations": [
+    "EditorConfig.EditorConfig",
+    "foxundermoon.shell-format",
+    "timonwong.shellcheck",
+    "mads-hartmann.bash-ide-vscode"
+  ]
+}
