@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+
+set -eo pipefail
+
+kring_home=${KRING_HOME:-$HOME/.kring}
+keyfile=${KRING_KEYFILE:-$kring_home/secret}
+datadir=$kring_home/data
+indexfile=$kring_home/index
+pidfile=$kring_home/kring-$$.pid
+lockfile=$kring_home/index.lock
+
+kring::main() {
+  while getopts h OPT; do
+    case $OPT in
+    *)
+      kring::help
+      return $?
+      ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+
+  if [[ $# -lt 1 ]]; then
+    kring::help
+    return $?
+  fi
+
+  local action=$1
+  shift
+
+  case $action in
+  init) kring::init "$@" ;;
+  list | ls) kring::list "$@" ;;
+  set) kring::set "$@" ;;
+  get) kring::get "$@" ;;
+  delete) kring::delete "$@" ;;
+  restore) kring::restore "$@" ;;
+  clean) kring::clean "$@" ;;
+  *) kring::help "$@" ;;
+  esac
+}
+
+kring::help() {
+  cat >&2 <<EOS
+Usage: ${0##*/} [-h]
+       ${0##*/} init
+       ${0##*/} <list|ls>
+       ${0##*/} set KEYNAME
+       ${0##*/} get [-n] KEYNAME
+       ${0##*/} delete KEYNAME
+       ${0##*/} restore KEYNAME
+       ${0##*/} clean
+
+The password manager written in Bash.
+
+Options:
+  -h    show this message
+  -n    do not print the trailing newline character
+
+Environment Variables:
+  KRING_HOME
+        KRING directory (default: $HOME/.kring)
+
+  KRING_KEYFILE
+        key file (default: $KRING_HOME/secret)
+EOS
+  return 2
+}
+
+kring::init() {
+  if [[ $# -gt 0 ]]; then
+    kring::error "$*: Too many arguments"
+    kring::help
+    return $?
+  fi
+
+  if ! kring::lock; then
+    kring::error "$lockfile: Already locked"
+    return 1
+  fi
+
+  if [[ ! -d "$datadir" ]]; then
+    mkdir -p "$kring_home"
+    openssl rand 1024 -base64 >"$keyfile"
+    return
+  fi
+
+  if [[ -f "$keyfile" ]]; then
+    kring::info "$keyfile alreadt exists."
+    kring::info -n "Overwrite [Y/n]? "
+    read -n1 -r input
+    kring::info
+    if [[ "$input" != Y ]]; then
+      return 1
+    fi
+  fi
+
+  openssl rand 1024 -base64 >"$keyfile".new
+  find "$datadir" -type f -not -name '*.new' -print0 |
+    while IFS= read -r -d '' file; do
+      openssl enc -aes256 -d -kfile "$keyfile" -base64 -in "$file" |
+        openssl enc -aes256 -kfile "$keyfile".new -base64 -out "$file".new
+    done
+
+  find "$datadir" -type f -name '*.new' -print0 |
+    while IFS= read -r -d '' file; do
+      mv "$file" "${file%.new}"
+    done
+  mv "$keyfile".new "$keyfile"
+
+  kring::info "Wrote $keyfile"
+}
+
+kring::list() {
+  if [[ $# -gt 0 ]]; then
+    kring::error "$*: Too many arguments"
+    kring::help
+    return $?
+  fi
+
+  if [[ ! -f "$indexfile" ]]; then
+    return
+  fi
+
+  cut -f 2 "$indexfile" | while read -r line; do
+    echo "$line" | openssl enc -base64 -d
+    echo
+  done
+}
+
+kring::get() {
+  local no_newline=no
+  while getopts n OPT; do
+    case $OPT in
+    n) no_newline=yes ;;
+    *)
+      kring::help
+      return $?
+      ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+
+  if [[ $# -lt 1 ]]; then
+    kring::error "KEYNAME not set"
+    kring::help
+    return $?
+  fi
+  local key=$1
+  shift
+
+  if [[ $# -gt 0 ]]; then
+    kring::error "$*: Too many arguments"
+    kring::help
+    return $?
+  fi
+
+  local keyhash
+  keyhash=$(echo -n "$key" | openssl dgst -sha256)
+
+  if [[ ! -f "$datadir"/"${keyhash:0:2}"/"${keyhash:2}" ]]; then
+    kring::error "$key: No such key"
+    return 1
+  fi
+
+  openssl enc -aes256 -d -kfile "$keyfile" -base64 -in \
+    "$datadir"/"${keyhash:0:2}"/"${keyhash:2}"
+  if [[ "$no_newline" = no ]]; then
+    echo
+  fi
+}
+
+kring::set() {
+  if [[ $# -lt 1 ]]; then
+    kring::error "KEYNAME not set"
+    kring::help
+    return $?
+  fi
+  local key=$1
+  shift
+
+  if [[ $# -gt 0 ]]; then
+    kring::error "$*: Too many arguments"
+    kring::help
+    return $?
+  fi
+
+  if ! kring::lock; then
+    kring::error "$lockfile: Already locked"
+    return 1
+  fi
+
+  local keyhash
+  keyhash=$(echo -n "$key" | openssl dgst -sha256)
+
+  mkdir -p "$datadir"/"${keyhash:0:2}"
+  if [[ -p /dev/stdin ]]; then
+    echo
+    openssl enc -aes256 -kfile "$keyfile" -base64 -out \
+      "$datadir"/"${keyhash:0:2}"/"${keyhash:2}" </dev/stdin
+  else
+    local input
+    echo -n 'Input password: ' >&2
+    read -r -s input
+    echo >&2
+    local confirm
+    echo -n 'Confirm: ' >&2
+    read -r -s confirm
+    echo >&2
+    if [[ "$input" != "$confirm" ]]; then
+      kring::error 'Missed.'
+    fi
+    echo -n "$input" | openssl enc -aes256 -kfile "$keyfile" -base64 -out \
+      "$datadir"/"${keyhash:0:2}"/"${keyhash:2}"
+  fi
+
+  kring::update_index "$key" "$keyhash"
+}
+
+kring::delete() {
+  if [[ $# -lt 1 ]]; then
+    kring::error "KEYNAME not set"
+    kring::help
+    return $?
+  fi
+  local key=$1
+  shift
+
+  if [[ $# -gt 0 ]]; then
+    kring::error "$*: Too many arguments"
+    kring::help
+    return $?
+  fi
+
+  if ! kring::lock; then
+    kring::error "$lockfile: Already locked"
+    return 1
+  fi
+
+  if [[ ! -f "$indexfile" ]]; then
+    return
+  fi
+
+  local keyhash
+  keyhash=$(echo -n "$key" | openssl dgst -sha256)
+  if grep -l "^$keyhash" "$indexfile" >/dev/null; then
+    touch "$indexfile"
+    cp "$indexfile" "$indexfile".2
+    grep -v "^$keyhash" "$indexfile.2" >"$indexfile" || true
+    rm "$indexfile".2
+  fi
+}
+
+kring::restore() {
+  if [[ $# -lt 1 ]]; then
+    kring::error "KEYNAME not set"
+    kring::help
+    return $?
+  fi
+  local key=$1
+  shift
+
+  if [[ $# -gt 0 ]]; then
+    kring::error "$*: Too many arguments"
+    kring::help
+    return $?
+  fi
+
+  if ! kring::lock; then
+    kring::error "$lockfile: Already locked"
+    return 1
+  fi
+
+  local keyhash
+  keyhash=$(echo -n "$key" | openssl dgst -sha256)
+
+  if [[ ! -f "$datadir"/"${keyhash:0:2}"/"${keyhash:2}" ]]; then
+    kring::error "$key: No such key"
+    return 1
+  fi
+
+  kring::update_index "$key" "$keyhash"
+}
+
+kring::clean() {
+  if [[ $# -gt 0 ]]; then
+    kring::error "$*: Too many arguments"
+    kring::help
+    return $?
+  fi
+
+  if ! kring::lock; then
+    kring::error "$lockfile: Already locked"
+    return 1
+  fi
+
+  find "$datadir" -type f -print0 | while IFS= read -r -d '' file; do
+    local hashkey
+    hashkey=$(echo "$file" | tr -d / | rev | cut -c -64 | rev)
+    if ! grep -l "^$hashkey" "$indexfile" >/dev/null; then
+      echo "$file"
+    fi
+  done | xargs rm
+  find "$datadir" -empty -delete
+}
+
+kring::update_index() {
+  local key=$1 keyhash=$2
+
+  touch "$indexfile"
+  if grep -l "^$keyhash" "$indexfile" >/dev/null; then
+    return
+  fi
+
+  local encoded
+  encoded=$(echo -n "$key" | openssl enc -base64 -A)
+
+  cp "$indexfile" "$indexfile"2
+  printf '%s\t%s\n' "$keyhash" "$encoded" >>"$indexfile"2
+  sort "$indexfile"2 | sort | uniq >"$indexfile"
+  rm "$indexfile"2
+}
+
+kring::info() {
+  echo "$@" >&2
+}
+
+kring::error() {
+  echo "${0##*/}: $*" >&2
+}
+
+kring::lock() {
+  mkdir -p "$kring_home"
+
+  trap 'rm -f "$pidfile"' EXIT
+  echo "$$" >"$pidfile"
+
+  ln "$pidfile" "$lockfile"
+  trap 'rm -f "$pidfile" "$lockfile"' EXIT
+}
+
+kring::main "$@"
